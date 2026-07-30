@@ -19,6 +19,22 @@ LIMITES DE DISEÑO (no negociables):
 - Rate-limiting explicito entre acciones: SCRAPER_MIN_DELAY_SECONDS (default 2.5s)
   + jitter, para no sobrecargar el sitio.
 
+SESION: dos modos.
+- Modo cookies (legacy): JSON exportado a mano (Cookie-Editor). PROBLEMA: el
+  token de sesion (octagon-jwtToken) y las cookies de PerimeterX (_px2/_pxde)
+  caducan en MINUTOS. Antes de abrir el navegador se hace un pre-flight: si el
+  token ya vencio, se aborta con exit 2 SIN navegar (fail-fast con instrucciones).
+- Modo perfil persistente (--profile-dir, recomendado): usa un user_data_dir de
+  Chromium en disco. El usuario se loguea UNA vez A MANO en la ventana visible
+  (--login) y la sesion vive en el perfil: las cookies se refrescan solas
+  durante la corrida, sin export manual ni TTL de minutos. El login sigue
+  siendo 100% humano; el script solo abre la ventana y espera.
+
+PAYWALL: un paywall en UNA pagina no aborta la corrida (puede ser un articulo
+puntual con otro tipo de acceso); el articulo se salta SIN marcarse como
+procesado (reintentable). Solo tras MAX_CONSECUTIVE_PAYWALLS paywalls
+consecutivos se concluye que la sesion murio y se aborta con exit 2.
+
 FORMATO del CSV de entrada (--url-list), una fila por resultado:
     ticker,headline,url,published_date_display,excluded_reason
     PBR,"Titular del articulo",https://www.bloomberg.com/news/articles/xxx,"July 3, 2025",
@@ -47,6 +63,14 @@ usa published_date_display del CSV (date_source="url_list"); si tampoco,
 published_at queda vacio (date_source="none").
 
 Uso:
+    # bootstrap del perfil persistente (una vez; login 100% manual):
+    python src/ingestion/bloomberg_scraper.py --profile-dir config/browser_profile --login
+
+    # corrida normal (modo perfil, recomendado):
+    python src/ingestion/bloomberg_scraper.py --profile-dir config/browser_profile \
+        --url-list data/raw/articles/_url_lists/PBR.csv
+
+    # modo cookies (legacy; ventana util de MINUTOS tras el export):
     python src/ingestion/bloomberg_scraper.py --url-list data/raw/articles/_url_lists/PBR.csv
     python src/ingestion/bloomberg_scraper.py --url-list lista.csv --tickers PBR,VALE
 """
@@ -78,6 +102,16 @@ DEFAULT_COOKIES_FILE = PROJECT_ROOT / "config" / "bloomberg_cookies.json"
 DEFAULT_MIN_DELAY = 2.5          # segundos; jitter agrega hasta +1.5s
 MIN_BODY_CHARS = 100             # umbral de exito: cuerpo real > 100 chars; si no -> parse fallido
 SAVE_EVERY = 15                  # guardado incremental -> corrida reanudable
+
+# Cookie que acredita la sesion de suscriptor. Si viene vencida en el export,
+# el paywall es seguro: se aborta ANTES de abrir el navegador (fail-fast).
+SESSION_COOKIE = "octagon-jwtToken"
+# Cookies de PerimeterX que acreditan que este navegador ya paso el control
+# anti-bot. Vencidas no son fatales, pero suben la probabilidad de desafio.
+ANTIBOT_COOKIES = ("_px2", "_pxde")
+# Umbral para distinguir "articulo puntual con paywall" (saltar y seguir) de
+# "sesion caida" (abortar): N paywalls consecutivos.
+MAX_CONSECUTIVE_PAYWALLS = 3
 
 # Columnas obligatorias del CSV de URLs.
 URL_LIST_COLUMNS = ["ticker", "headline", "url", "published_date_display", "excluded_reason"]
@@ -124,7 +158,12 @@ class Article:
 
 
 class SessionExpiredError(RuntimeError):
-    pass
+    """La sesion de suscriptor murio; no tiene sentido seguir (exit 2)."""
+
+
+class PaywallDetected(RuntimeError):
+    """Paywall/login en UNA pagina puntual. El llamador decide si es un
+    articulo aislado (saltar) o un patron de sesion caida (abortar)."""
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +228,66 @@ def load_cookies_for_playwright(cookies_file: Path) -> list[dict]:
     return cookies
 
 
+def check_session_cookies(
+    cookies: list[dict], now: Optional[float] = None
+) -> tuple[list[str], list[str]]:
+    """Pre-flight sobre las cookies criticas. Devuelve (fatales, advertencias).
+
+    Fatal = la corrida va a chocar con el paywall con certeza (token de sesion
+    ausente o vencido); mejor abortar ANTES de abrir el navegador, con
+    instrucciones, que fallar en el primer articulo.
+
+    Contexto: en la practica el token de sesion vive ~45 min y las cookies
+    anti-bot ~15 min desde el export. La ventana util de un export es de
+    minutos; para corridas largas usar --profile-dir (perfil persistente)."""
+    now = time.time() if now is None else now
+    by_name = {c["name"]: c for c in cookies}
+    fatal: list[str] = []
+    warnings: list[str] = []
+
+    jwt = by_name.get(SESSION_COOKIE)
+    if jwt is None:
+        fatal.append(
+            f"El export no contiene '{SESSION_COOKIE}' (el token de sesion de "
+            "suscriptor). Sin el, todos los articulos daran paywall. "
+            "Re-exporta las cookies LOGUEADO en bloomberg.com."
+        )
+    else:
+        exp = jwt.get("expires")
+        if isinstance(exp, (int, float)) and exp > 0:
+            remaining_min = (exp - now) / 60.0
+            if remaining_min <= 0:
+                fatal.append(
+                    f"'{SESSION_COOKIE}' vencio hace {-remaining_min:.0f} min. "
+                    "El paywall es seguro. Re-exporta las cookies de una sesion "
+                    "recien autenticada y corre INMEDIATAMENTE (la ventana util "
+                    "es de minutos), o usa --profile-dir para no depender de exports."
+                )
+            else:
+                warnings.append(
+                    f"'{SESSION_COOKIE}' vence en {remaining_min:.0f} min. Al ritmo "
+                    f"del rate-limit (~3.2 s/articulo) alcanza para ~"
+                    f"{int(remaining_min * 60 / 3.2)} articulos. Si la corrida es "
+                    "mas larga, usa --profile-dir o parte en tandas."
+                )
+
+    for name in ANTIBOT_COOKIES:
+        c = by_name.get(name)
+        if c is None:
+            warnings.append(
+                f"Falta la cookie anti-bot '{name}'; sube la probabilidad de "
+                "que salte el desafio (se pausara para resolucion manual)."
+            )
+            continue
+        exp = c.get("expires")
+        if isinstance(exp, (int, float)) and 0 < exp < now:
+            warnings.append(
+                f"La cookie anti-bot '{name}' ya vencio; sube la probabilidad "
+                "de que salte el desafio (se pausara para resolucion manual)."
+            )
+    return fatal, warnings
+
+
 # ---------------------------------------------------------------------------
 # Rate limiter
 # ---------------------------------------------------------------------------
@@ -242,7 +341,10 @@ def pause_for_manual_solve(page: Page) -> None:
 
 
 def safe_goto(page: Page, url: str, limiter: RateLimiter) -> None:
-    """Navega respetando rate-limit; pausa si hay desafio; aborta si hay paywall."""
+    """Navega respetando rate-limit; pausa si hay desafio; señala paywall.
+
+    Paywall -> PaywallDetected (por pagina). El llamador lleva la cuenta de
+    consecutivos y decide cuando concluir que la sesion murio."""
     limiter.wait()
     page.goto(url, wait_until="domcontentloaded", timeout=45000)
     # reintenta hasta 2 veces tras resolucion manual del desafio
@@ -253,10 +355,7 @@ def safe_goto(page: Page, url: str, limiter: RateLimiter) -> None:
         break
     low = (page.content() or "").lower()
     if any(m in low for m in PAYWALL_MARKERS):
-        raise SessionExpiredError(
-            f"Paywall/login detectado en {page.url}. Re-exporta cookies de una "
-            "sesion autenticada valida y vuelve a correr."
-        )
+        raise PaywallDetected(f"Paywall/login detectado en {page.url}")
 
 
 # ---------------------------------------------------------------------------
@@ -540,17 +639,39 @@ def scrape_url_list(
 
     batch: list[Article] = []
     added = 0
+    consecutive_paywalls = 0
     for i, row in enumerate(todo, start=1):
         url = row.url
         logger.info(f"[{ticker}] {i}/{len(todo)} {url}")
         try:
             safe_goto(page, url, limiter)
             headline, body, published, method = extract_article(page)
+        except PaywallDetected as e:
+            # Un paywall aislado puede ser un articulo puntual (otro tier de
+            # acceso). Se salta SIN marcar como procesado (reintentable). Solo
+            # un patron de consecutivos delata sesion caida.
+            consecutive_paywalls += 1
+            logger.warning(
+                f"[{ticker}] {e} ({consecutive_paywalls}/{MAX_CONSECUTIVE_PAYWALLS} "
+                "consecutivos); articulo saltado, NO marcado como scrapeado."
+            )
+            if consecutive_paywalls >= MAX_CONSECUTIVE_PAYWALLS:
+                # persistir lo acumulado antes de abortar
+                append_articles(ticker, batch)
+                raise SessionExpiredError(
+                    f"{consecutive_paywalls} paywalls consecutivos: la sesion "
+                    "murio. Renueva la sesion (re-login en el perfil con "
+                    "--login, o re-exporta cookies) y relanza el mismo comando; "
+                    "la corrida se reanuda sola."
+                )
+            continue
         except SessionExpiredError:
+            append_articles(ticker, batch)
             raise
         except Exception as e:
             logger.warning(f"[{ticker}] fallo articulo {url}: {e}")
             continue
+        consecutive_paywalls = 0
 
         # extraccion fallida: ni JSON ni DOM superaron MIN_BODY_CHARS. NO se
         # marca como procesado (no entra a seen ni al parquet); se guarda el
@@ -607,8 +728,9 @@ def main() -> int:
     p = argparse.ArgumentParser(
         description="Scraper Bloomberg via Playwright sobre una lista de URLs pre-recolectada"
     )
-    p.add_argument("--url-list", type=Path, required=True,
-                   help=f"CSV con columnas {', '.join(URL_LIST_COLUMNS)}")
+    p.add_argument("--url-list", type=Path,
+                   help=f"CSV con columnas {', '.join(URL_LIST_COLUMNS)} "
+                        "(obligatorio salvo con --login)")
     p.add_argument("--tickers", help="subset separado por comas; filtra filas DENTRO del CSV")
     p.add_argument("--start-date", default=os.environ.get("SCRAPER_START_DATE"),
                    help="filtro client-side opcional; requiere tambien --end-date")
@@ -620,9 +742,26 @@ def main() -> int:
                    help="tope de articulos a procesar por ticker")
     p.add_argument("--cookies-file", type=Path,
                    default=Path(os.environ.get("BLOOMBERG_COOKIES_FILE", DEFAULT_COOKIES_FILE)))
+    p.add_argument("--profile-dir", type=Path,
+                   default=(Path(os.environ["BLOOMBERG_PROFILE_DIR"])
+                            if os.environ.get("BLOOMBERG_PROFILE_DIR") else None),
+                   help="user_data_dir persistente de Chromium (RECOMENDADO): la sesion "
+                        "vive en el perfil y se refresca sola; no depende de exports de "
+                        "cookies que caducan en minutos. Sugerido: config/browser_profile")
+    p.add_argument("--login", action="store_true",
+                   help="solo con --profile-dir: abre bloomberg.com en la ventana visible "
+                        "para que TU te loguees A MANO, guarda la sesion en el perfil y "
+                        "sale. El script no toca el formulario de login.")
     p.add_argument("--headless", action="store_true",
                    help="NO recomendado: sin ventana no puedes resolver desafios manualmente")
     args = p.parse_args()
+
+    if args.login and not args.profile_dir:
+        p.error("--login requiere --profile-dir (la sesion debe persistir en un perfil)")
+    if args.login and args.headless:
+        p.error("--login necesita ventana visible (quita --headless)")
+    if not args.login and not args.url_list:
+        p.error("--url-list es obligatorio (salvo con --login)")
 
     # Filtro de fechas DESACTIVADO salvo que se pasen ambas: las URLs vienen
     # curadas a mano, filtrar de nuevo solo puede descartar filas validas.
@@ -635,6 +774,33 @@ def main() -> int:
     else:
         logger.info("Sin filtro de fechas (URLs pre-curadas).")
 
+    # --login: bootstrap manual de la sesion en el perfil persistente. El
+    # script NO toca el formulario: abre la ventana, el humano se loguea, y la
+    # sesion queda en user_data_dir para las corridas siguientes.
+    if args.login:
+        args.profile_dir.mkdir(parents=True, exist_ok=True)
+        with sync_playwright() as pw:
+            context = pw.chromium.launch_persistent_context(
+                str(args.profile_dir), headless=False
+            )
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto("https://www.bloomberg.com", wait_until="domcontentloaded",
+                      timeout=60000)
+            logger.info("=" * 70)
+            logger.info("Logueate MANUALMENTE en la ventana del navegador.")
+            logger.info("Cuando veas tu cuenta activa, vuelve aqui y presiona ENTER.")
+            logger.info("=" * 70)
+            try:
+                input(">>> ENTER cuando hayas terminado el login... ")
+            except EOFError:
+                logger.error("--login requiere terminal interactiva.")
+                context.close()
+                return 2
+            context.close()
+        logger.info(f"Sesion guardada en el perfil {args.profile_dir}. "
+                    "Corre el scraper con el mismo --profile-dir.")
+        return 0
+
     url_df = load_url_list(args.url_list)
     if args.tickers:
         wanted = {t.strip().upper() for t in args.tickers.split(",")}
@@ -644,16 +810,48 @@ def main() -> int:
             return 1
 
     company_map = load_company_map()
-    cookies = load_cookies_for_playwright(args.cookies_file)
+
+    cookies: list[dict] = []
+    if args.profile_dir:
+        # La sesion vive en el perfil y se refresca sola; inyectar un export
+        # viejo podria PISAR cookies frescas del perfil, asi que no se cargan.
+        logger.info(f"Modo perfil persistente: {args.profile_dir} "
+                    "(--cookies-file se ignora en este modo).")
+        if not args.profile_dir.exists():
+            logger.error(
+                f"El perfil {args.profile_dir} no existe. Crealo y logueate una "
+                f"vez con: python {Path(sys.argv[0]).name} --profile-dir "
+                f"{args.profile_dir} --login"
+            )
+            return 2
+    else:
+        cookies = load_cookies_for_playwright(args.cookies_file)
+        # Pre-flight: mejor abortar aqui, con instrucciones, que chocar con el
+        # paywall en el primer articulo con el navegador ya abierto.
+        fatal, warnings = check_session_cookies(cookies)
+        for w in warnings:
+            logger.warning(w)
+        if fatal:
+            for msg in fatal:
+                logger.error(msg)
+            return 2
+
     min_delay = float(os.environ.get("SCRAPER_MIN_DELAY_SECONDS", DEFAULT_MIN_DELAY))
     limiter = RateLimiter(min_delay)
 
     failed: list[str] = []
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=args.headless)
-        context = browser.new_context()
-        context.add_cookies(cookies)
-        page = context.new_page()
+        if args.profile_dir:
+            browser = None
+            context = pw.chromium.launch_persistent_context(
+                str(args.profile_dir), headless=args.headless
+            )
+            page = context.pages[0] if context.pages else context.new_page()
+        else:
+            browser = pw.chromium.launch(headless=args.headless)
+            context = browser.new_context()
+            context.add_cookies(cookies)
+            page = context.new_page()
         try:
             for ticker, rows in url_df.groupby("ticker", sort=False):
                 company = company_map.get(ticker)
@@ -676,7 +874,8 @@ def main() -> int:
                     failed.append(ticker)
         finally:
             context.close()
-            browser.close()
+            if browser is not None:
+                browser.close()
 
     if failed:
         logger.error(f"TICKERS FALLIDOS: {', '.join(failed)}")
