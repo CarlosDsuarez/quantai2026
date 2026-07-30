@@ -1,5 +1,6 @@
 .env
 config/bloomberg_cookies.json
+config/browser_profile/
 data/raw/
 data/processed/
 outputs/
