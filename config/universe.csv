@@ -1,0 +1,31 @@
+ticker,nombre,pais,sector,vol_dolar_diario_prom_M
+AAPL,Apple,US,Tech,11988.0
+MSFT,Microsoft,US,Tech,10224.3
+NVDA,Nvidia,US,Tech,32452.6
+GOOGL,Alphabet,US,Tech,6486.4
+AMZN,Amazon,US,Consumer Disc,8881.6
+META,Meta,US,Tech,8595.4
+JPM,JPMorgan,US,Financials,2162.5
+BAC,Bank of America,US,Financials,1619.9
+GS,Goldman Sachs,US,Financials,1307.1
+TSLA,Tesla,US,Consumer Disc,27314.2
+WMT,Walmart,US,Consumer Staples,1694.8
+KO,Coca-Cola,US,Consumer Staples,1003.1
+JNJ,Johnson & Johnson,US,Healthcare,1540.9
+PFE,Pfizer,US,Healthcare,1037.9
+UNH,UnitedHealth,US,Healthcare,2672.1
+XOM,Exxon Mobil,US,Energy,1956.2
+CVX,Chevron,US,Energy,1350.1
+BA,Boeing,US,Industrials,1552.4
+NU,Nubank,BR,Fintech,528.8
+VALE,Vale,BR,Materials-Mining,320.4
+PBR,Petrobras,BR,Energy-Oil&Gas,261.6
+ITUB,Itau Unibanco,BR,Financials-Banking,133.6
+BBD,Bradesco,BR,Financials-Banking,84.5
+STNE,StoneCo,BR,Fintech,62.1
+ABEV,Ambev,BR,Consumer Staples,58.3
+GGB,Gerdau,BR,Materials-Steel,40.7
+SBS,Sabesp,BR,Utilities,21.3
+SUZ,Suzano,BR,Materials-PulpPaper,19.6
+UGP,Ultrapar,BR,Energy-Logistics,7.6
+TIMB,TIM Brasil,BR,Telecom,7.5

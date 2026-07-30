@@ -1,0 +1,8 @@
+.env
+config/bloomberg_cookies.json
+data/raw/
+data/processed/
+outputs/
+__pycache__/
+*.pyc
+.venv/
