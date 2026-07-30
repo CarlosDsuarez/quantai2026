@@ -112,6 +112,9 @@ def canonicalize_url(raw: str) -> Optional[str]:
     path = parts.path
     if not path.startswith("/news/"):
         return None
+    # algunas capturas archivadas traen whitespace URL-encoded al final del
+    # slug (p.ej. ...%0a); se recorta para no duplicar ni romper el goto
+    path = re.sub(r"(?:%0[ad9]|\s)+$", "", path, flags=re.IGNORECASE)
     # sin query (utm, ref=, etc.), sin fragmento, sin slash final
     return "https://www.bloomberg.com" + path.rstrip("/")
 
@@ -275,10 +278,24 @@ def fetch_wayback_urls(
     Devuelve (urls, prefijos_fallidos). Un prefijo que falla no aborta el
     resto: se reporta para re-correr (el merge al CSV es idempotente)."""
     urls: list[str] = []
-    failed: list[str] = []
     prefixes = month_prefixes(start, end)
     logger.info(f"wayback: {len(prefixes)} queries mensuales "
                 f"({start.isoformat()} -> {end.isoformat()})")
+    failed = _query_prefixes(prefixes, keywords, urls, fetch)
+    if failed:
+        # Los fallos observados en la practica (503/504/cuerpo no-JSON) son
+        # transitorios del servidor: un segundo pase suele completarlos sin
+        # tener que re-correr el comando entero.
+        logger.info(f"segundo pase sobre {len(failed)} prefijos fallidos")
+        failed = _query_prefixes(failed, keywords, urls, fetch)
+    return urls, failed
+
+
+def _query_prefixes(
+    prefixes: list[str], keywords: list[str], urls: list[str], fetch: Callable
+) -> list[str]:
+    """Consulta cada prefijo y acumula URLs en `urls`. Devuelve los fallidos."""
+    failed: list[str] = []
     for i, prefix in enumerate(prefixes, start=1):
         params = {
             "url": prefix,
@@ -308,7 +325,7 @@ def fetch_wayback_urls(
         if found:
             logger.info(f"[{i}/{len(prefixes)}] {prefix}: {len(found)} URLs")
         urls.extend(found)
-    return urls, failed
+    return failed
 
 
 # ---------------------------------------------------------------------------

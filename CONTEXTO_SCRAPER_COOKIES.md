@@ -430,8 +430,11 @@ sesión.
   rate-limit público es agresivo; queda como opción a explorar).
 - Limitación conocida: recall imperfecto — artículos cuyo slug no menciona la empresa no
   aparecen, y la Wayback Machine solo tiene lo que alguien archivó. Corrida real de
-  validación (PBR, 2023-07-01 → 2026-07-15): ver el número exacto en el PR; complementar
-  a mano si la cobertura por mes es baja (el merge respeta lo manual).
+  validación (PBR, 2023-07-01 → 2026-07-15): **216 artículos únicos procesables**
+  (41 de 2023, ~114 de 2024, 60 de 2025, 29 de 2026 antes de dedup) — más del doble de
+  los 86 que asumía el plan original. Complementar a mano si la cobertura por mes es
+  baja (el merge respeta lo manual). El CSV vive en `data/` (gitignored): regenerarlo
+  es un solo comando (§9 paso 1).
 
 ### 10.3 Paywall robusto (§8.3)
 

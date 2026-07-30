@@ -31,6 +31,8 @@ def test_slugify_company(nombre, slug):
      "https://www.bloomberg.com/news/articles/2025-07-03/petrobras-x"),
     ("https://www.bloomberg.com/news/articles/2025-07-03/petrobras-x/",
      "https://www.bloomberg.com/news/articles/2025-07-03/petrobras-x"),
+    ("https://www.bloomberg.com/news/articles/2025-07-03/petrobras-x%0A",
+     "https://www.bloomberg.com/news/articles/2025-07-03/petrobras-x"),  # \n encoded
     ("https://www.bloomberg.com/opinion/articles/2025-07-03/x", None),   # no /news/
     ("https://example.com/news/articles/2025-07-03/x", None),            # otro host
 ])
@@ -189,3 +191,24 @@ def test_fetch_wayback_urls_reports_failed_prefixes_and_continues():
         "bloomberg.com/news/articles/2025-06*",
         "bloomberg.com/news/features/2025-06*",
     ]
+
+
+def test_fetch_wayback_urls_second_pass_recovers_transient_failures():
+    # el primer intento de un prefijo da 503; el segundo pase lo recupera
+    attempts: dict[str, int] = {}
+
+    def fetch(url, params):
+        prefix = params["url"]
+        attempts[prefix] = attempts.get(prefix, 0) + 1
+        if prefix == "bloomberg.com/news/articles/2025-07*" and attempts[prefix] == 1:
+            return FakeResp(status_code=503)
+        return FakeResp(payload=[
+            ["original"],
+            [f"https://www.bloomberg.com/news/articles/2025-07-01/petrobras-{len(attempts)}"],
+        ])
+
+    urls, failed = ulb.fetch_wayback_urls(
+        ["petrobras"], date(2025, 7, 1), date(2025, 7, 31), fetch=fetch)
+    assert failed == []
+    assert len(urls) == 2  # articles (2do pase) + features (1er pase)
+    assert attempts["bloomberg.com/news/articles/2025-07*"] == 2
